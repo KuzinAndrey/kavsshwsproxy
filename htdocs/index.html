@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+<link rel="stylesheet" href="node_modules/@xterm/xterm/css/xterm.css" />
+<script src="node_modules/@xterm/xterm/lib/xterm.js"></script>
+<script src="node_modules/@xterm/addon-attach/lib/addon-attach.js"></script>
+</head>
+<body>
+<div id="terminal"></div>
+<script>
+try {
+	if (!window["WebSocket"]) throw Error("Your browser does not support WebSockets");
+
+	var term = null;
+	var websocket = null;
+
+	websocket = new WebSocket("wss://192.168.2.23:6970/proxy?uuid=4fa5c9c3-b485-4f19-b93e-01e7416b1111&user=test&pass=123456");
+
+	if (websocket) {
+		term = new Terminal();
+		term.loadAddon(new AttachAddon.AttachAddon(websocket));
+		term.open(document.getElementById('terminal'));
+		websocket.onclose = function(evt) {
+			if (term) term.dispose();
+		}
+	};
+} catch(e) {
+	alert(e);
+}
+</script>
+</body>
+</html>
