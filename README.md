@@ -154,6 +154,12 @@ in `/tmp`. As man-in-middle proxy write all traffic in gzipped log file and save
 analysis of session history. This file can be saved in storage or database by external
 script or application.
 
+## Self signed certificate for SSL
+
+```shell
+openssl req -new -x509 -nodes -days 36500 -keyout prikey.pem -out fullchain.pem
+```
+
 ## Links
 
 * https://github.com/xtermjs/xterm.js

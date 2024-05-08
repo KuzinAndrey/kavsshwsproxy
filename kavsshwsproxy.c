@@ -15,12 +15,13 @@ History:
     2024-05-04 - Initial version
     2024-05-05 - Add session gzipped log write, SSL connection support
     2024-05-06 - Add cli options, help page, terminal size in URL
+    2024-05-08 - Connection list, web /status page, MT refactor
 ///////////////////////////////////////////////////////
 */
 
 #define PROJECT_NAME "kavsshwsproxy"
-#define PROJECT_VERSION "0.1"
-#define PROJECT_DATE "2024-05-06"
+#define PROJECT_VERSION "0.2"
+#define PROJECT_DATE "2024-05-08"
 #define PROJECT_GIT "https://github.com/KuzinAndrey"
 #define REC_HEADER_SIGN "SSH_SESSION_RECORD"
 
@@ -59,7 +60,7 @@ History:
 #define LIBSSH2_HOSTKEY_HASH_SHA1_LEN 20
 #endif
 
-// #define DEBUG(...) fprintf(stderr, __VA_ARGS__);
+// #define DEBUG(...) { fprintf(stderr, __VA_ARGS__); fprintf(stderr,"\n"); }
 #define DEBUG(...) syslog(LOG_INFO | LOG_PID, __VA_ARGS__);
 
 #define DIE_OPENSSL(name) { fprintf(stderr, \
@@ -86,6 +87,15 @@ char *opt_cert_full_chain = "fullchain.pem";
 char *opt_cert_primary = "prikey.pem";
 
 struct proxy_session {
+	pthread_t th;
+	pthread_mutex_t mutex;
+	struct proxy_session *next;
+	struct proxy_session *prev;
+
+	struct timeval start_time;
+	size_t ssh_to_ws;
+	size_t ws_to_ssh;
+
 	libssh2_socket_t sock;
 	struct sockaddr_in sin;
 	char *user;
@@ -99,18 +109,21 @@ struct proxy_session {
 	LIBSSH2_SESSION *session;
 	LIBSSH2_LISTENER *listener;
 	LIBSSH2_CHANNEL *channel;
-	int ssh_ok;
+	int ssh_state; // 0 - unknown, 1 - work, 2 - closed
 
 	struct evws_connection *evws;
 	char name[INET6_ADDRSTRLEN];
-	int websocket_ok;
+	int websocket_state; // 0 - unknown, 1 - work, 2- closed
 
 	unsigned long uuid[5];
 	int record;
 	char *record_name;
 	gzFile record_fd;
-	pthread_mutex_t gzmutex;
 };
+
+static pthread_mutex_t proxy_session_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct proxy_session *proxy_session_list = NULL;
+int terminate = 0;
 
 // Call back for incoming websocket data write to ssh channel
 static void
@@ -120,24 +133,39 @@ websocket_msg_cb(struct evws_connection *evws, int type, const unsigned char *da
 	struct proxy_session *self = arg;
 	struct timeval curtime = {0};
 
-	if (!self->ssh_ok) return;
+	if (self->ssh_state == 2) {
+		DEBUG("SSH is closed, close websocket %s too", self->name);
+		evws_close(self->evws, WS_CR_NORMAL);
+		return;
+	}
 
 	ssize_t n;
 	size_t pos = 0;
 	do {
-		n = libssh2_channel_write(self->channel,(const char *) data + pos, len - pos);
-		if (n == LIBSSH2_ERROR_EAGAIN) continue;
-		else if (n < 0) break;
-		pos += n;
+		if (self->ssh_state == 1) {
+			pthread_mutex_lock(&self->mutex);
+			if (!self->channel) {
+				pthread_mutex_unlock(&self->mutex);
+				break;
+			}
+			n = libssh2_channel_write(self->channel,(const char *) data + pos, len - pos);
+			pthread_mutex_unlock(&self->mutex);
+			if (n == LIBSSH2_ERROR_EAGAIN) continue;
+			else if (n < 0) break;
+			pos += n;
+			self->ws_to_ssh += n;
+		} else break;
 
-		if (self->record && self->record_fd) {
-			pthread_mutex_lock(&self->gzmutex);
+		if (self->record) {
 			gettimeofday(&curtime, NULL);
-			gzwrite(self->record_fd, &curtime, sizeof(struct timeval));
-			gzwrite(self->record_fd,">>",3);
-			gzwrite(self->record_fd, &n, sizeof(n));
-			gzwrite(self->record_fd, data + pos, len - pos);
-			pthread_mutex_unlock(&self->gzmutex);
+			pthread_mutex_lock(&self->mutex);
+			if (self->record_fd) {
+				gzwrite(self->record_fd, &curtime, sizeof(struct timeval));
+				gzwrite(self->record_fd,">>",3);
+				gzwrite(self->record_fd, &n, sizeof(n));
+				gzwrite(self->record_fd, data + pos, len - pos);
+			}
+			pthread_mutex_unlock(&self->mutex);
 		}
 	} while (len - pos > 0);
 } // websocket_msg_cb()
@@ -145,9 +173,9 @@ websocket_msg_cb(struct evws_connection *evws, int type, const unsigned char *da
 static void
 websocket_close_cb(struct evws_connection *evws, void *arg)
 {
-	struct proxy_session *client = arg;
-	DEBUG("WebSocket '%s' disconnected", client->name);
-	client->websocket_ok = 0;
+	struct proxy_session *self = arg;
+	DEBUG("WebSocket '%s' disconnected", self->name);
+	self->websocket_state = 2;
 } // websocket_close_cb()
 
 static const char *
@@ -234,6 +262,8 @@ void clean_proxy_session(struct proxy_session *sess) {
 	if (sess->prikey) { free(sess->prikey); sess->prikey = NULL; }
 	if (sess->keypass) { free(sess->keypass); sess->keypass = NULL; }
 	if (sess->server_ip) { free(sess->server_ip); sess->server_ip = NULL; }
+
+	sess->ssh_state = 2; // closed
 } // clean_proxy_session()
 
 
@@ -376,17 +406,15 @@ void *ssh_session_read_thread(void *data) {
 	size_t s;
 	struct timeval curtime = {0};
 
-	pthread_mutex_init(&self->gzmutex,NULL);
-
 	if (self->record) {
-		pthread_mutex_lock(&self->gzmutex);
+		pthread_mutex_lock(&self->mutex);
 		sprintf(buf, TMP_DIR_UUID_FORMAT,
 			self->uuid[0], self->uuid[1], self->uuid[2],
 			self->uuid[3], self->uuid[4],"sshtmp");
 		self->record_fd = gzopen(buf,"w");
 		if (self->record_fd) {
 			self->record_name = strdup(buf);
-			gettimeofday(&curtime, NULL);
+			gettimeofday(&self->start_time, NULL);
 			gzwrite(self->record_fd, REC_HEADER_SIGN, strlen(REC_HEADER_SIGN) + 1);
 			gzwrite(self->record_fd, PROJECT_NAME, sizeof(PROJECT_NAME));
 			gzwrite(self->record_fd, PROJECT_VERSION, sizeof(PROJECT_VERSION));
@@ -397,14 +425,17 @@ void *ssh_session_read_thread(void *data) {
 			gzwrite(self->record_fd, self->uuid, sizeof(self->uuid));
 			s = sizeof(struct timeval);
 			gzwrite(self->record_fd, &s, sizeof(s));
-			gzwrite(self->record_fd, &curtime, sizeof(struct timeval));
+			gzwrite(self->record_fd, &self->start_time, sizeof(struct timeval));
 		}
-		pthread_mutex_unlock(&self->gzmutex);
+		pthread_mutex_unlock(&self->mutex);
 	}
 
-	while (self->websocket_ok == 0) {};
+	while (0 == self->websocket_state) {};
 
-	while(!libssh2_channel_eof(self->channel) && self->websocket_ok == 1) {
+	while (!libssh2_channel_eof(self->channel)
+		&& 1 == self->websocket_state
+		&& 0 == terminate
+	) {
 		ssize_t len = libssh2_channel_read(self->channel, buf, sizeof(buf));
 		if(len < 0) {
 			if (LIBSSH2_ERROR_EAGAIN == len) {
@@ -414,40 +445,40 @@ void *ssh_session_read_thread(void *data) {
 			DEBUG( "Unable to read response from %s:%d - %ld", self->server_ip, self->port, (long)len);
 			break;
 		} else {
-			if (self->websocket_ok == 1 && self->evws) {
+			if (self->websocket_state == 1 && self->evws) {
 				evws_send_binary(self->evws, buf, len);
-				if (self->record && self->record_fd) {
-					pthread_mutex_lock(&self->gzmutex);
-					gettimeofday(&curtime, NULL);
-					gzwrite(self->record_fd, &curtime, sizeof(struct timeval));
-					gzwrite(self->record_fd,"<<",3);
-					gzwrite(self->record_fd, &len, sizeof(len));
-					gzwrite(self->record_fd, buf, len);
-					pthread_mutex_unlock(&self->gzmutex);
+				self->ssh_to_ws += len;
+				if (self->record) {
+					pthread_mutex_lock(&self->mutex);
+					if (self->record_fd) {
+						gettimeofday(&curtime, NULL);
+						gzwrite(self->record_fd, &curtime, sizeof(struct timeval));
+						gzwrite(self->record_fd,"<<",3);
+						gzwrite(self->record_fd, &len, sizeof(len));
+						gzwrite(self->record_fd, buf, len);
+					}
+					pthread_mutex_unlock(&self->mutex);
 				}
 			} else break;
 		}
 	} // while
-	self->ssh_ok = 0;
+	self->ssh_state = 0; // unknown
 
-	sleep(1); // stupid sync
-	DEBUG("Thread clean %s@%s:%d -> WS %s",self->user,self->server_ip,self->port, self->name);
-	if (self->websocket_ok == 1 && self->evws) {
-		DEBUG("Thread websocket close %s", self->name);
-		evws_close(self->evws, WS_CR_NORMAL);
-	}
+	pthread_mutex_lock(&self->mutex);
 
 	clean_ssh_channel(self);
 	clean_proxy_session(self);
-	sleep(1); // stupid sync
 	if (self->record_fd) {
 		gzclose(self->record_fd);
+		self->record_fd = NULL;
 		if (self->record_name) {
 			sprintf(buf, TMP_DIR_UUID_FORMAT,
 				self->uuid[0], self->uuid[1], self->uuid[2],
 				self->uuid[3], self->uuid[4],"sshproxyrec.gz");
 			if (-1 == rename(self->record_name, buf)) {
 				DEBUG("Can't rename %s to %s", self->record_name, buf);
+			} else {
+				DEBUG("Rename %s to %s", self->record_name, buf);
 			}
 		}
 	}
@@ -455,8 +486,16 @@ void *ssh_session_read_thread(void *data) {
 		free(self->record_name);
 		self->record_name = NULL;
 	}
-	free(self);
-//	DEBUG("Thread exit");
+
+	pthread_mutex_unlock(&self->mutex);
+
+	sleep(1);
+	if (self->websocket_state == 1) {
+		DEBUG("WebSocket '%s' is work, close it too", self->name);
+		evws_close(self->evws, WS_CR_NORMAL);
+	}
+
+	memset(&self->th, 0, sizeof(self->th));
 	pthread_exit(NULL);
 } // ssh_session_read_thread()
 
@@ -513,7 +552,7 @@ int up_ssh_channel(struct proxy_session *sess) {
 	} // while term
 
 	if (*term == NULL) {
-		DEBUG("Can't found any pty type on SSH");
+		DEBUG("Can't found any pty type on SSH %s@%s", sess->user, sess->server_ip);
 		return 1;
 	}
 
@@ -534,15 +573,15 @@ int up_ssh_channel(struct proxy_session *sess) {
 	while(1) {
 		rc = libssh2_channel_shell(sess->channel);
 		if (rc == 0) {
-			DEBUG("Successfully requested shell");
+			DEBUG("Successfully requested shell on %s@%s", sess->user, sess->server_ip);
 			break;
 		}
 		if (rc == LIBSSH2_ERROR_EAGAIN) {
-			DEBUG("Get EAGAIN while requested shell");
+			DEBUG("Get EAGAIN while requested shell on %s@%s", sess->user, sess->server_ip);
 			ssh_waitsocket(sess->sock, sess->session);
 			continue;
 		} else if (rc < 0) {
-			DEBUG("Unable to request shell on allocated channel");
+			DEBUG("Unable to request shell on allocated channel %s@%s", sess->user, sess->server_ip);
 			rc = libssh2_session_last_error(sess->session, &err, NULL, 0);
 			DEBUG("libssh2 error: %d - %s", rc, err);
 			return 1;
@@ -552,22 +591,7 @@ int up_ssh_channel(struct proxy_session *sess) {
 	libssh2_channel_set_blocking(sess->channel, 0);
 
 	DEBUG("Up ssh channel successful %s@%s:%d", sess->user, sess->server_ip, sess->port);
-	sess->ssh_ok = 1;
-
-	pthread_t th;
-	rc = pthread_create(&th, NULL, ssh_session_read_thread, (void *)sess);
-	if (rc != 0) {
-		DEBUG("Unable create pthread for %s@%s:%d", sess->user, sess->server_ip, sess->port);
-		return 1;
-	}
-
-	rc = pthread_detach(th);
-	if (rc != 0) {
-		DEBUG("Can't detach pthread for %s@%s:%d", sess->user, sess->server_ip, sess->port);
-		return 1;
-	}
-
-	DEBUG("Start ssh channel thread for %s@%s:%d", sess->user, sess->server_ip, sess->port);
+	sess->ssh_state = 1; // work
 
 	return 0;
 } // up_ssh_channel()
@@ -582,6 +606,7 @@ static void web_proxy_cb(struct evhttp_request *req, void *arg)
 	char prikey_path[5 * 4 * 2 + 5 + 15];
 	char pubkey_path[5 * 4 * 2 + 5 + 15];
 	char buf[256];
+	int rc;
 
 //	// Don't log any full URI (it has password in plain text) !!!
 //	DEBUG("[%s]: %s", req->remote_host, req->uri);
@@ -666,6 +691,8 @@ static void web_proxy_cb(struct evhttp_request *req, void *arg)
 		DEBUG("Can't allocate memory for session");
 		goto err;
 	}
+
+	pthread_mutex_init(&ps->mutex,NULL);
 	ps->user = q_user; q_user = NULL;
 	ps->keypass = q_pass; q_pass = NULL;
 	ps->record = q_record;
@@ -701,6 +728,30 @@ static void web_proxy_cb(struct evhttp_request *req, void *arg)
 		goto err;
 	}
 
+	// Start thread
+	rc = pthread_create(&ps->th, NULL, ssh_session_read_thread, (void *)ps);
+	if (rc != 0) {
+		DEBUG("Unable create pthread for %s@%s:%d", ps->user, ps->server_ip, ps->port);
+		goto err;
+	}
+	DEBUG("Start ssh channel thread for %s@%s:%d", ps->user, ps->server_ip, ps->port);
+
+/*
+	// TODO join or detach ?!
+	rc = pthread_detach(ps->th);
+	if (rc != 0) {
+		DEBUG("Can't detach pthread for %s@%s:%d", sess->user, sess->server_ip, sess->port);
+		return 1;
+	}
+*/
+
+	// Add to list
+	pthread_mutex_lock(&proxy_session_list_mutex);
+		ps->next = proxy_session_list;
+		if (proxy_session_list) proxy_session_list->prev = ps;
+		proxy_session_list = ps;
+	pthread_mutex_unlock(&proxy_session_list_mutex);
+
 	// Create WebSocket
 	ps->evws = evws_new_session(req, websocket_msg_cb, ps, 0);
 	if (!ps->evws) {
@@ -720,11 +771,11 @@ static void web_proxy_cb(struct evhttp_request *req, void *arg)
 	while (l-1 > 0 && isspace(buf[l-1])) { buf[l-1] = 0; l--; } // trim right
 	if (strncmp(ps->name, buf, l) == 0 && ps->name[l] == ':') {
 		DEBUG("New client joined from [%s]", ps->name);
-		ps->websocket_ok = 1;
+		ps->websocket_state = 1; // work
 	} else {
 		DEBUG("Unknown client [%s] try connect, need [%s], drop connection", ps->name, buf);
+		ps->websocket_state = 2; // close websocket
 		evws_close(ps->evws, WS_CR_NORMAL);
-		ps->websocket_ok = 2; // exit websocket
 	}
 
 	goto exit;
@@ -740,6 +791,29 @@ exit:
 	if (q_user) free(q_user);
 	if (q_pass) free(q_pass);
 	if (f) fclose(f);
+
+	// Garbage cleaner
+	pthread_mutex_lock(&proxy_session_list_mutex);
+	if (proxy_session_list) {
+		struct proxy_session *s = proxy_session_list;
+		while (s) {
+			struct proxy_session *o = NULL;
+			if (s->websocket_state == 2 && s->ssh_state == 2) {
+				o = s;
+				if (!s->prev)
+					proxy_session_list = s->next;
+				else
+					s->prev->next = s->next;
+				if (s->next) s->next->prev = s->prev;
+			}
+			s = s->next;
+			if (o) {
+				DEBUG("Clean memory from garbage session");
+				free(o);
+			}
+		}
+	}
+	pthread_mutex_unlock(&proxy_session_list_mutex);
 } // web_proxy_cb()
 
 
@@ -765,6 +839,81 @@ err:
 	evhttp_send_error(req, HTTP_NOTFOUND, NULL);
 }
 
+static void
+web_status_cb(struct evhttp_request *req, void *arg)
+{
+	struct evbuffer *evb;
+
+	if (req->output_headers) {
+		evhttp_add_header(req->output_headers, "Content-Type", "text/html");
+		evhttp_add_header(req->output_headers, "Expires", "Mon, 01 Jan 1995 00:00:00 GMT");
+		evhttp_add_header(req->output_headers, "Cache-Control", "no-cache, must-revalidate");
+		evhttp_add_header(req->output_headers, "Pragma", "no-cache");
+		evhttp_add_header(req->output_headers, "Refresh", "10");
+	}
+
+	evb = evbuffer_new();
+	if (!evb) goto err;
+
+	evbuffer_add_printf(evb, "<html><body>");
+	evbuffer_add_printf(evb, "<h3>%s v%s</h3>", PROJECT_NAME, PROJECT_VERSION);
+
+	evbuffer_add_printf(evb, "<p>Your IP: %s<br>", req->remote_host);
+
+	evbuffer_add_printf(evb, "<p><b>Sessions</b>:<br><ol>");
+	pthread_mutex_lock(&proxy_session_list_mutex);
+	struct proxy_session *w = proxy_session_list;
+	char buf[256];
+	int c = 0;
+	while (w) {
+		evbuffer_add_printf(evb, "<li>");
+		pthread_mutex_lock(&w->mutex);
+
+		sprintf(buf, TMP_DIR_UUID_FORMAT,
+			w->uuid[0], w->uuid[1], w->uuid[2],
+			w->uuid[3], w->uuid[4],"sshtmp");
+
+		evbuffer_add_printf(evb, "%s<br>%s@%s from %s",buf, w->user, w->server_ip, w->name);
+		evbuffer_add_printf(evb, " SSH_");
+		switch (w->ssh_state) {
+			case 0: evbuffer_add_printf(evb, "UNKNOWN"); break;
+			case 1: evbuffer_add_printf(evb, "OK"); break;
+			case 2: evbuffer_add_printf(evb, "CLOSED"); break;
+		}
+
+		evbuffer_add_printf(evb, " WS_");
+		switch (w->websocket_state) {
+			case 0: evbuffer_add_printf(evb, "UNKNOWN"); break;
+			case 1: evbuffer_add_printf(evb, "OK"); break;
+			case 2: evbuffer_add_printf(evb, "CLOSED"); break;
+		}
+
+		evbuffer_add_printf(evb, " ssh %ld bytes", w->ssh_to_ws);
+		evbuffer_add_printf(evb, ", ws %ld bytes", w->ws_to_ssh);
+
+		pthread_mutex_unlock(&w->mutex);
+		evbuffer_add_printf(evb, "</li>");
+		c++;
+		w = w->next;
+	}
+	pthread_mutex_unlock(&proxy_session_list_mutex);
+	evbuffer_add_printf(evb, "</ol>");
+	if (c == 0) evbuffer_add_printf(evb, "No active sessions");
+	evbuffer_add_printf(evb, "</p>");
+	evbuffer_add_printf(evb, "<p><a href=%s/%s target=_blank>%s/%s</a>"
+		, PROJECT_GIT, PROJECT_NAME
+		, PROJECT_GIT, PROJECT_NAME);
+	evbuffer_add_printf(evb, "<br>License: MIT %s</p>", PROJECT_DATE);
+	evbuffer_add_printf(evb, "</body></html>");
+	evhttp_send_reply(req, HTTP_OK, NULL, evb);
+	evbuffer_free(evb);
+	return;
+
+err:
+	evhttp_send_error(req, HTTP_INTERNAL, NULL);
+}
+
+
 /*
 #ifndef EVENT__HAVE_STRSIGNAL
 static inline const char *
@@ -779,6 +928,7 @@ signal_cb(evutil_socket_t fd, short event, void *arg)
 {
 	DEBUG("%s signal received", strsignal(fd));
 	event_base_loopbreak(arg);
+	terminate = 1;
 }
 
 
@@ -804,6 +954,7 @@ int
 main(int argc, char **argv)
 {
 	SSL_CTX *ctx = NULL;
+	struct proxy_session *s;
 
 	// Parse program options
 	int opt = 0;
@@ -887,7 +1038,7 @@ main(int argc, char **argv)
 
 	evhttp_set_cb(http_server, "/", web_root_cb, NULL);
 	evhttp_set_cb(http_server, "/proxy", web_proxy_cb, NULL);
-	//TODO status page
+	evhttp_set_cb(http_server, "/status", web_status_cb, NULL);
 
 	DEBUG("%s server start listening on %s:%d ...", argv[0], opt_server_bind, opt_server_port);
 
@@ -906,6 +1057,8 @@ main(int argc, char **argv)
 	event_base_dispatch(base);
 	evhttp_free(http_server);
 exit:
+	terminate = 1;
+
 	event_free(sig_int);
 	event_base_free(base);
 
@@ -916,7 +1069,12 @@ exit:
 
 	libevent_global_shutdown();
 
-	// TODO terminate detached threads and wait for close ?!
+	// wait for terminate threads
+	s = proxy_session_list;
+	while (s) {
+		pthread_join(s->th, NULL);
+		s = s->next;
+	}
 
 	DEBUG("%s exiting", argv[0]);
 	closelog();
