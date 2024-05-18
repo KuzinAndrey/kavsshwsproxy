@@ -16,8 +16,8 @@ Time for turn on C power !
 
 ```
 $ LD_LIBRARY_PATH=/usr/local/lib64 ./kavsshwsproxy -h
-kavsshwsproxy (v0.1) SSH via WebSocket proxy
-Kuzin Andrey (2024-05-06) MIT - https://github.com/KuzinAndrey/kavsshwsproxy
+kavsshwsproxy (v0.3) SSH via WebSocket proxy
+Kuzin Andrey (2024-05-12) MIT - https://github.com/KuzinAndrey/kavsshwsproxy
 libevent version: "2.2.1-alpha-dev"
 OpenSSL version: "OpenSSL 1.1.1k  FIPS 25 Mar 2021"
 libssh2 version: "1.11.1_DEV"
@@ -30,6 +30,8 @@ Usage: ./kavsshwsproxy [options]
 	-a <fullchain.pem> - fullchain SSL cert PEM file (default: "fullchain.pem")
 	-b <primary> - primary SSL cert PEM file (default: "prikey.pem")
 	-x <termtype> - SSH PTY terminal type (ex. xterm-color, ansi, vt100 ...)
+	-d <records_dir> - path to directory with records (default: "/tmp/records")
+	-s <suffix> - records file suffix (default: "sshproxyrec.gz")
 ```
 
 ## Prepare libraries for build

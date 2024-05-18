@@ -16,12 +16,13 @@ History:
     2024-05-05 - Add session gzipped log write, SSL connection support
     2024-05-06 - Add cli options, help page, terminal size in URL
     2024-05-08 - Connection list, web /status page, MT refactor
+    2024-05-12 - Fix recording, add pty size
 ///////////////////////////////////////////////////////
 */
 
 #define PROJECT_NAME "kavsshwsproxy"
-#define PROJECT_VERSION "0.2"
-#define PROJECT_DATE "2024-05-08"
+#define PROJECT_VERSION "0.3"
+#define PROJECT_DATE "2024-05-12"
 #define PROJECT_GIT "https://github.com/KuzinAndrey"
 #define REC_HEADER_SIGN "SSH_SESSION_RECORD"
 
@@ -69,7 +70,7 @@ History:
 	ERR_print_errors_fp(stderr); \
 	exit(EXIT_FAILURE); }
 
-#define TMP_DIR_UUID_FORMAT "/tmp/%08lx-%04lx-%04lx-%04lx-%012lx.%s"
+#define DIR_UUID_FORMAT "%s/%08lx-%04lx-%04lx-%04lx-%012lx.%s"
 
 // Libevent global objects
 struct event_base *base;
@@ -85,6 +86,8 @@ int opt_foreground = 0;
 char *opt_ssh_term = NULL; // "xterm-color";
 char *opt_cert_full_chain = "fullchain.pem";
 char *opt_cert_primary = "prikey.pem";
+char *opt_tmp_dir = "/tmp";
+char *opt_records_dir = "/tmp/records";
 
 struct proxy_session {
 	pthread_t th;
@@ -156,14 +159,14 @@ websocket_msg_cb(struct evws_connection *evws, int type, const unsigned char *da
 			self->ws_to_ssh += n;
 		} else break;
 
-		if (self->record) {
+		if (self->record && n > 0) {
 			gettimeofday(&curtime, NULL);
 			pthread_mutex_lock(&self->mutex);
 			if (self->record_fd) {
 				gzwrite(self->record_fd, &curtime, sizeof(struct timeval));
 				gzwrite(self->record_fd,">>",3);
 				gzwrite(self->record_fd, &n, sizeof(n));
-				gzwrite(self->record_fd, data + pos, len - pos);
+				gzwrite(self->record_fd, data + pos, n);
 			}
 			pthread_mutex_unlock(&self->mutex);
 		}
@@ -402,13 +405,13 @@ void clean_ssh_channel(struct proxy_session *sess) {
 
 void *ssh_session_read_thread(void *data) {
 	struct proxy_session *self = data;
-	char buf[1024];
+	char buf[1024 * 32];
 	size_t s;
 	struct timeval curtime = {0};
 
 	if (self->record) {
 		pthread_mutex_lock(&self->mutex);
-		sprintf(buf, TMP_DIR_UUID_FORMAT,
+		sprintf(buf, DIR_UUID_FORMAT, opt_tmp_dir,
 			self->uuid[0], self->uuid[1], self->uuid[2],
 			self->uuid[3], self->uuid[4],"sshtmp");
 		self->record_fd = gzopen(buf,"w");
@@ -423,6 +426,8 @@ void *ssh_session_read_thread(void *data) {
 			gzwrite(self->record_fd, self->name, strlen(self->name) + 1);
 			gzwrite(self->record_fd, self->user, strlen(self->user) + 1);
 			gzwrite(self->record_fd, self->uuid, sizeof(self->uuid));
+			gzwrite(self->record_fd, &self->pty_cols, sizeof(self->pty_cols));
+			gzwrite(self->record_fd, &self->pty_rows, sizeof(self->pty_rows));
 			s = sizeof(struct timeval);
 			gzwrite(self->record_fd, &s, sizeof(s));
 			gzwrite(self->record_fd, &self->start_time, sizeof(struct timeval));
@@ -472,7 +477,7 @@ void *ssh_session_read_thread(void *data) {
 		gzclose(self->record_fd);
 		self->record_fd = NULL;
 		if (self->record_name) {
-			sprintf(buf, TMP_DIR_UUID_FORMAT,
+			sprintf(buf, DIR_UUID_FORMAT, opt_records_dir,
 				self->uuid[0], self->uuid[1], self->uuid[2],
 				self->uuid[3], self->uuid[4],"sshproxyrec.gz");
 			if (-1 == rename(self->record_name, buf)) {
@@ -556,15 +561,17 @@ int up_ssh_channel(struct proxy_session *sess) {
 		return 1;
 	}
 
-	// Apply PTY size if defined
-	if (sess->pty_cols > 0 || sess->pty_rows > 0) {
-		int w = LIBSSH2_TERM_WIDTH;
-		int h = LIBSSH2_TERM_HEIGHT;
-		if (sess->pty_cols > 0) w = sess->pty_cols;
-		if (sess->pty_rows > 0) h = sess->pty_rows;
-		rc = libssh2_channel_request_pty_size(sess->channel, w, h);
+	// Apply PTY size if not default
+	if (
+		sess->pty_cols != LIBSSH2_TERM_WIDTH
+		|| sess->pty_rows != LIBSSH2_TERM_HEIGHT
+	) {
+		rc = libssh2_channel_request_pty_size(sess->channel,
+			sess->pty_cols, sess->pty_rows);
 		if (rc == 0) {
-			DEBUG("Change pty size on %s@%s to %d x %d", sess->user, sess->server_ip, w, h);
+			DEBUG("Change pty size on %s@%s to %d x %d",
+				sess->user, sess->server_ip,
+				sess->pty_cols, sess->pty_rows);
 		}
 	}
 
@@ -647,21 +654,24 @@ static void web_proxy_cb(struct evhttp_request *req, void *arg)
 	}
 
 	// Check SSH session files
-	sprintf(info_path,TMP_DIR_UUID_FORMAT,uuid[0],uuid[1],uuid[2],uuid[3],uuid[4], "sshws");
+	sprintf(info_path, DIR_UUID_FORMAT, opt_tmp_dir,
+		uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], "sshws");
 	if (access(info_path, R_OK) != 0) {
 		DEBUG("Can't found file %s", info_path);
 		http_err_code = HTTP_NOTFOUND;
 		goto err;
 	}
 
-	sprintf(prikey_path,TMP_DIR_UUID_FORMAT,uuid[0],uuid[1],uuid[2],uuid[3],uuid[4],"pri");
+	sprintf(prikey_path, DIR_UUID_FORMAT, opt_tmp_dir,
+		uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], "pri");
 	if (access(prikey_path, W_OK | R_OK) != 0) {
 		DEBUG("Can't found file %s", prikey_path);
 		http_err_code = HTTP_NOTFOUND;
 		goto err;
 	}
 
-	sprintf(pubkey_path,TMP_DIR_UUID_FORMAT,uuid[0],uuid[1],uuid[2],uuid[3],uuid[4],"pub");
+	sprintf(pubkey_path, DIR_UUID_FORMAT, opt_tmp_dir,
+		uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], "pub");
 	if (access(pubkey_path, W_OK | R_OK) != 0) {
 		DEBUG("Can't found file %s", pubkey_path);
 		http_err_code = HTTP_NOTFOUND;
@@ -702,8 +712,8 @@ static void web_proxy_cb(struct evhttp_request *req, void *arg)
 	ps->pubkey = strdup(pubkey_path);
 	ps->prikey = strdup(prikey_path);
 	memcpy(&ps->uuid, &uuid, sizeof(uuid));
-	if (q_cols > 0) ps->pty_cols = q_cols;
-	if (q_rows > 0) ps->pty_rows = q_rows;
+	ps->pty_cols = (q_cols > 0) ? q_cols : LIBSSH2_TERM_WIDTH;
+	ps->pty_rows = (q_rows > 0) ? q_rows : LIBSSH2_TERM_HEIGHT;
 
 	// second line client IP to allow connection
 	if (!fgets(buf, sizeof(buf), f)) {
@@ -869,7 +879,7 @@ web_status_cb(struct evhttp_request *req, void *arg)
 		evbuffer_add_printf(evb, "<li>");
 		pthread_mutex_lock(&w->mutex);
 
-		sprintf(buf, TMP_DIR_UUID_FORMAT,
+		sprintf(buf, DIR_UUID_FORMAT, opt_tmp_dir,
 			w->uuid[0], w->uuid[1], w->uuid[2],
 			w->uuid[3], w->uuid[4],"sshtmp");
 
@@ -941,11 +951,13 @@ void print_help(const char *prog) {
 	printf("\nUsage: %s [options]\n", prog);
 	printf("\t-f - foreground mode (daemonize by default)\n");
 	printf("\t-l <ip> - listening IP (default: \"%s\")\n", opt_server_bind);
-	printf("\t-p <port> - ssh port (default: %d)\n", opt_server_port);
+	printf("\t-p <port> - listening port (default: %d)\n", opt_server_port);
 	printf("\t-k - insecure HTTP mode\n");
 	printf("\t-a <fullchain.pem> - fullchain SSL cert PEM file (default: \"%s\")\n",opt_cert_full_chain);
 	printf("\t-b <primary> - primary SSL cert PEM file (default: \"%s\")\n",opt_cert_primary);
 	printf("\t-x <termtype> - SSH PTY terminal type (ex. xterm-color, ansi, vt100 ...)\n");
+	printf("\t-t <tmp_dir> - temporary files dir (default: \"%s\")\n", opt_tmp_dir);
+	printf("\t-r <records_dir> - dir for save records (default: \"%s\")\n", opt_records_dir);
 	exit(0);
 } // print_help()
 
@@ -958,7 +970,7 @@ main(int argc, char **argv)
 
 	// Parse program options
 	int opt = 0;
-	while ( (opt = getopt(argc, argv, "hfl:p:ka:b:x:")) != -1)
+	while ( (opt = getopt(argc, argv, "hfl:p:ka:b:x:t:r:")) != -1)
 	switch (opt) {
 		case 'h': print_help(argv[0]); break;
 		case 'f': opt_foreground = 1; break;
@@ -968,6 +980,8 @@ main(int argc, char **argv)
 		case 'a': opt_cert_full_chain = optarg; break;
 		case 'b': opt_cert_primary = optarg; break;
 		case 'x': opt_ssh_term = optarg; break;
+		case 't': opt_tmp_dir = optarg; break;
+		case 'r': opt_records_dir = optarg; break;
 		case '?':
 			fprintf(stderr,"Unknown option: %c\n", optopt);
 			return 1;
@@ -988,6 +1002,8 @@ main(int argc, char **argv)
 		fprintf(stderr, "ERROR: listening port can't be zero or parse failure\n");
 		return 1;
 	}
+
+	// TODO check directories opt_tmp_dir, opt_records_dir for existance
 
 	openlog(argv[0], LOG_PID, LOG_DAEMON);
 

@@ -1,0 +1,99 @@
+<!doctype html>
+<html>
+<head>
+<link rel="stylesheet" href="node_modules/@xterm/xterm/css/xterm.css" />
+<script src="node_modules/@xterm/xterm/lib/xterm.js"></script>
+<script src="node_modules/@xterm/addon-attach/lib/addon-attach.js"></script>
+</head>
+<body>
+<table>
+<tr><td>
+TIME: <span id=btime></span>
+<button id=bstop onclick="b_stop()">Stop</button>
+<button id=bpause onclick="b_pause()">Pause</button>
+<button id=bplay onclick="b_play()" style="display:none">Play</button>
+</td></tr>
+<tr><td>INFO: <span id="info">no</span></td></tr>
+<tr><td><div id="terminal"></div></td></tr>
+</table>
+<script>
+function base64ToBytes(base64) {
+  const binString = atob(base64);
+  return Uint8Array.from(binString, (m) => m.codePointAt(0));
+}
+try {
+	var term = null;
+	var websocket = null;
+//	var uuid = "9b072417-08f9-4a74-bd43-19ad103999c7";
+	var uuid = "4fa5c9c3-b485-4f19-b93e-01e7416b1111";
+	var time_el = document.getElementById('btime');
+
+	var pass = "nopass";
+	if (!window["WebSocket"]) throw Error("Your browser does not support WebSockets");
+
+	websocket = new WebSocket("wss://192.168.2.23:6971/play?uuid="+uuid+"&pass="+pass);
+
+	if (websocket) {
+		websocket.onclose = function(evt) {
+			if (term) term.dispose();
+			websocket = null;
+			document.getElementById('info').innerHTML = 'no';
+			time_el.innerHTML = '';
+		}
+		websocket.onmessage = (event) => {
+			// console.log(event.data);
+			try {
+				let o = JSON.parse(event.data);
+				if (typeof(o.info) !== 'undefined') {
+					let t = document.getElementById('terminal');
+					let i = document.getElementById('info');
+					if (t && i) {
+						term = new Terminal({cursorBlink: true, enableBold: true, cols: o.cols, rows: o.rows});
+						term.open(t);
+						i.innerHTML = o.uuid + ", " + o.user + "@" + o.server_ip + ":" + o.server_port;
+					}
+				} else {
+					if (typeof(o.data) !== 'undefined') {
+						term.write(new TextDecoder('utf-8').decode(base64ToBytes(o.data)));
+					}
+					if (typeof(o.time) !== 'undefined') {
+						time_el.innerHTML = (Math.round(o.time * 100) / 100).toFixed(2);
+					}
+					if (typeof(o.skip) !== 'undefined') {
+						let r = Math.round(1 + Math.random() * 1000);
+						time_el.innerHTML += " <button id=skip_"+r+">skip "+o.skip+"</button>";
+						let el = document.getElementById("skip_"+r);
+						if (el) el.onclick = () => { if (websocket) websocket.send("/skip");};
+					}
+				}
+			} catch (err) {
+				console.log(err);
+			}
+		};
+	};
+} catch(e) {
+	alert(e);
+}
+
+function b_stop() {
+	if (websocket) {
+		websocket.send("/stop");
+	}
+}
+function b_pause() {
+	if (websocket) {
+		websocket.send("/pause");
+		document.getElementById('bpause').style.display = "none";
+		document.getElementById('bplay').style.display = "";
+	}
+}
+function b_play() {
+	if (websocket) {
+		websocket.send("/play");
+		document.getElementById('bpause').style.display = "";
+		document.getElementById('bplay').style.display = "none";
+	}
+}
+</script>
+</body>
+</html>
