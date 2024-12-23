@@ -988,12 +988,12 @@ main(int argc, char **argv)
 			break;
 	}; // switch
 
-	if (-1 == access(opt_cert_full_chain, F_OK)) {
+	if (opt_use_ssl && -1 == access(opt_cert_full_chain, F_OK)) {
 		fprintf(stderr, "ERROR: can't find file %s\n", opt_cert_full_chain);
 		return 1;
 	}
 
-	if (-1 == access(opt_cert_primary, F_OK)) {
+	if (opt_use_ssl && -1 == access(opt_cert_primary, F_OK)) {
 		fprintf(stderr, "ERROR: can't find file %s\n", opt_cert_primary);
 		return 1;
 	}
